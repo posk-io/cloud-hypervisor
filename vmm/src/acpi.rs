@@ -283,7 +283,7 @@ fn create_tpm2_table() -> Sdt {
 
 fn create_srat_table(
     numa_nodes: &NumaNodes,
-    #[cfg(target_arch = "x86_64")] topology: Option<(u8, u8, u8)>,
+    #[cfg(target_arch = "x86_64")] topology: Option<(u16, u16, u16, u16)>,
 ) -> Sdt {
     let mut srat = Sdt::new(*b"SRAT", 36, 3, *b"CLOUDH", *b"CHSRAT  ", 1);
     // SRAT reserved 12 bytes
@@ -324,9 +324,9 @@ fn create_srat_table(
 
         for cpu in &node.cpus {
             #[cfg(target_arch = "x86_64")]
-            let x2apic_id = arch::x86_64::get_x2apic_id(*cpu as u32, topology);
+            let x2apic_id = arch::x86_64::get_x2apic_id(*cpu, topology);
             #[cfg(target_arch = "aarch64")]
-            let x2apic_id = *cpu as u32;
+            let x2apic_id = *cpu;
 
             // Flags
             // - Enabled = 1 (bit 0)

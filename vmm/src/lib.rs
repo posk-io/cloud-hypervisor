@@ -884,6 +884,19 @@ impl Vmm {
             ))
         })?;
 
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        if let Some(topology) = config.lock().unwrap().cpus.topology.clone() {
+            let max_apic_id = arch::x86_64::get_max_x2apic_id((
+                topology.threads_per_core,
+                topology.cores_per_die,
+                topology.dies_per_package,
+                topology.packages,
+            ));
+            if max_apic_id > 254 {
+                vm.enable_x2apic_api().unwrap();
+            }
+        }
+
         let phys_bits =
             vm::physical_bits(&self.hypervisor, config.lock().unwrap().cpus.max_phys_bits);
 
@@ -1806,7 +1819,7 @@ impl RequestHandler for Vmm {
 
     fn vm_resize(
         &mut self,
-        desired_vcpus: Option<u8>,
+        desired_vcpus: Option<u32>,
         desired_ram: Option<u64>,
         desired_balloon: Option<u64>,
     ) -> result::Result<(), VmError> {

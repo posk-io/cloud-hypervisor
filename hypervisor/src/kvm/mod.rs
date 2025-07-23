@@ -55,7 +55,8 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     kvm_enable_cap, kvm_msr_entry, MsrList, KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP,
-    KVM_GUESTDBG_USE_HW_BP,
+    KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
+    KVM_X2APIC_API_USE_32BIT_IDS,
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
@@ -492,6 +493,37 @@ impl KvmVm {
     pub fn check_extension(&self, c: Cap) -> bool {
         self.fd.check_extension(c)
     }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Translates the MSI extended destination ID bits according to the logic
+    /// found in the Linux kernel's KVM MSI handling.
+    ///
+    /// This function moves bits [11, 5] from `address_lo` to bits [46, 40] in the combined 64-bit
+    /// address, but only if the Remappable Format (RF) bit (bit 4) in `address_lo` is
+    /// not set and `address_hi` is zero.
+    fn translate_msi_ext_dest_id(&self, address_lo: &mut u32, address_hi: &mut u32) {
+        // Mask for extracting the RF (Remappable Format) bit from address_lo.
+        // In the MSI specification, this is bit 4. See
+        // VT-d spec section "Interrupt Requests in Remappable Format"
+        const REMAPPABLE_FORMAT_BIT_MASK: u32 = 0x10;
+        let remappable_format_bit_is_set = (*address_lo & REMAPPABLE_FORMAT_BIT_MASK) != 0;
+
+        // Only perform the bit swizzling if the RF bit is unset and the upper
+        // 32 bits of the address are all zero. This identifies the legacy format.
+        if *address_hi == 0 && !remappable_format_bit_is_set {
+            // "Move" the bits [11,5] to bits [46,40]. This is a shift of 35 bits, but
+            // since address is already split up into lo and hi, it's only a shift of
+            // 3 (35 - 32) within hi.
+            // "Move" via getting the bits via mask, zeroing out that range, and then
+            // ORing them back in at the correct location. The destination was already
+            // checked to be all zeroes.
+            const EXT_ID_MASK: u32 = 0xfe0;
+            const EXT_ID_SHIFT: u32 = 3;
+            let ext_id = *address_lo & EXT_ID_MASK;
+            *address_lo &= !EXT_ID_MASK;
+            *address_hi |= ext_id << EXT_ID_SHIFT;
+        }
+    }
 }
 
 /// Implementation of Vm trait for KVM
@@ -559,7 +591,7 @@ impl vm::Vm for KvmVm {
     ///
     fn create_vcpu(
         &self,
-        id: u8,
+        id: u32,
         vm_ops: Option<Arc<dyn VmOps>>,
     ) -> vm::Result<Arc<dyn cpu::Vcpu>> {
         let fd = self
@@ -647,8 +679,22 @@ impl vm::Vm for KvmVm {
                     ..Default::default()
                 };
 
-                kvm_route.u.msi.address_lo = cfg.low_addr;
-                kvm_route.u.msi.address_hi = cfg.high_addr;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut address_lo = cfg.low_addr;
+                    let mut address_hi = cfg.high_addr;
+
+                    // Translate extended destination ID if needed.
+                    self.translate_msi_ext_dest_id(&mut address_lo, &mut address_hi);
+
+                    kvm_route.u.msi.address_lo = address_lo;
+                    kvm_route.u.msi.address_hi = address_hi;
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    kvm_route.u.msi.address_lo = cfg.low_addr;
+                    kvm_route.u.msi.address_hi = cfg.high_addr;
+                }
                 kvm_route.u.msi.data = cfg.data;
 
                 if self.check_extension(crate::kvm::Cap::MsiDevid) {
@@ -819,6 +865,28 @@ impl vm::Vm for KvmVm {
         self.fd
             .enable_cap(&cap)
             .map_err(|e| vm::HypervisorVmError::EnableSplitIrq(e.into()))?;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn enable_x2apic_api(&self) -> vm::Result<()> {
+        // From https://docs.kernel.org/virt/kvm/api.html:
+        // On x86, kvm_msi::address_hi is ignored unless the KVM_X2APIC_API_USE_32BIT_IDS feature of
+        // KVM_CAP_X2APIC_API capability is enabled. If it is enabled, address_hi bits 31-8
+        // provide bits 31-8 of the destination id. Bits 7-0 of address_hi must be zero.
+
+        // Thus KVM_X2APIC_API_USE_32BIT_IDS in combination with KVM_FEATURE_MSI_EXT_DEST_ID allows
+        // the guest to target interrupts to cpus with APIC IDs > 254.
+
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_X2APIC_API,
+            ..Default::default()
+        };
+        cap.args[0] =
+            (KVM_X2APIC_API_USE_32BIT_IDS | KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK) as u64;
+        self.fd
+            .enable_cap(&cap)
+            .map_err(|e| vm::HypervisorVmError::EnableX2ApicApi(e.into()))?;
         Ok(())
     }
 
@@ -2150,7 +2218,7 @@ impl cpu::Vcpu for KvmVcpu {
         &self,
         vm: &Arc<dyn crate::Vm>,
         kvi: &mut crate::VcpuInit,
-        id: u8,
+        id: u32,
     ) -> cpu::Result<()> {
         use std::arch::is_aarch64_feature_detected;
         #[allow(clippy::nonminimal_bool)]
@@ -2280,7 +2348,7 @@ impl cpu::Vcpu for KvmVcpu {
     /// Configure core registers for a given CPU.
     ///
     #[cfg(target_arch = "aarch64")]
-    fn setup_regs(&self, cpu_id: u8, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
+    fn setup_regs(&self, cpu_id: u32, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
         // Get the register index of the PSTATE (Processor State) register.
         let pstate = offset_of!(kvm_regs, regs.pstate);
         self.fd
@@ -2326,7 +2394,7 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     /// Configure registers for a given RISC-V CPU.
     ///
-    fn setup_regs(&self, cpu_id: u8, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
+    fn setup_regs(&self, cpu_id: u32, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
         // Setting the A0 () to the hartid of this CPU.
         let a0 = offset_of!(kvm_riscv_core, regs.a0);
         self.fd

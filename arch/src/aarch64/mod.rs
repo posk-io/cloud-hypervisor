@@ -67,7 +67,7 @@ pub struct EntryPoint {
 /// Configure the specified VCPU, and return its MPIDR.
 pub fn configure_vcpu(
     vcpu: &Arc<dyn hypervisor::Vcpu>,
-    id: u8,
+    id: u32,
     boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
 ) -> super::Result<u64> {
     if let Some((kernel_entry_point, _guest_memory)) = boot_setup {
@@ -126,7 +126,7 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::Bui
     guest_mem: &GuestMemoryMmap,
     cmdline: &str,
     vcpu_mpidr: Vec<u64>,
-    vcpu_topology: Option<(u8, u8, u8)>,
+    vcpu_topology: Option<(u16, u16, u16, u16)>,
     device_info: &HashMap<(DeviceType, String), T, S>,
     initrd: &Option<super::InitramfsConfig>,
     pci_space_info: &[PciSpaceInfo],

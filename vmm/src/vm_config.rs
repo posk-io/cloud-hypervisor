@@ -23,7 +23,7 @@ pub(crate) trait ApplyLandlock {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CpuAffinity {
-    pub vcpu: u8,
+    pub vcpu: u32,
     pub host_cpus: Vec<usize>,
 }
 
@@ -36,10 +36,10 @@ pub struct CpuFeatures {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CpuTopology {
-    pub threads_per_core: u8,
-    pub cores_per_die: u8,
-    pub dies_per_package: u8,
-    pub packages: u8,
+    pub threads_per_core: u16,
+    pub cores_per_die: u16,
+    pub dies_per_package: u16,
+    pub packages: u16,
 }
 
 // When booting with PVH boot the maximum physical addressable size
@@ -53,8 +53,8 @@ pub fn default_cpuconfig_max_phys_bits() -> u8 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CpusConfig {
-    pub boot_vcpus: u8,
-    pub max_vcpus: u8,
+    pub boot_vcpus: u32,
+    pub max_vcpus: u32,
     #[serde(default)]
     pub topology: Option<CpuTopology>,
     #[serde(default)]
@@ -67,7 +67,7 @@ pub struct CpusConfig {
     pub features: CpuFeatures,
 }
 
-pub const DEFAULT_VCPUS: u8 = 1;
+pub const DEFAULT_VCPUS: u32 = 1;
 
 impl Default for CpusConfig {
     fn default() -> Self {
@@ -671,7 +671,7 @@ pub struct NumaConfig {
     #[serde(default)]
     pub guest_numa_id: u32,
     #[serde(default)]
-    pub cpus: Option<Vec<u8>>,
+    pub cpus: Option<Vec<u32>>,
     #[serde(default)]
     pub distances: Option<Vec<NumaDistance>>,
     #[serde(default)]

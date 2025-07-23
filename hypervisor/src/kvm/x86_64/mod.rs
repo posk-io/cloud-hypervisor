@@ -60,6 +60,11 @@ pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
     check_extension!(Cap::VcpuEvents);
     check_extension!(Cap::Xcrs);
     check_extension!(Cap::Xsave);
+
+    // TODO: uncomment below when PR https://github.com/rust-vmm/kvm/pull/333
+    // is merged and published to crates.io.
+    // check_extension!(Cap::X2ApicApi);
+
     Ok(())
 }
 

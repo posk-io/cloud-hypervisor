@@ -126,6 +126,11 @@ pub enum HypervisorVmError {
     #[error("Failed to enable split Irq")]
     EnableSplitIrq(#[source] anyhow::Error),
     ///
+    /// Enable x2apic API error
+    ///
+    #[error("Failed to enable x2apic API")]
+    EnableX2ApicApi(#[source] anyhow::Error),
+    ///
     /// Enable SGX attribute error
     ///
     #[error("Failed to enable SGX attribute")]
@@ -319,7 +324,7 @@ pub trait Vm: Send + Sync + Any {
     /// Unregister an event that will, when signaled, trigger the `gsi` IRQ.
     fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> Result<()>;
     /// Creates a new KVM vCPU file descriptor and maps the memory corresponding
-    fn create_vcpu(&self, id: u8, vm_ops: Option<Arc<dyn VmOps>>) -> Result<Arc<dyn Vcpu>>;
+    fn create_vcpu(&self, id: u32, vm_ops: Option<Arc<dyn VmOps>>) -> Result<Arc<dyn Vcpu>>;
     #[cfg(target_arch = "aarch64")]
     fn create_vgic(&self, config: VgicConfig) -> Result<Arc<Mutex<dyn Vgic>>>;
     #[cfg(target_arch = "riscv64")]
@@ -358,6 +363,8 @@ pub trait Vm: Send + Sync + Any {
     /// Enable split Irq capability
     #[cfg(target_arch = "x86_64")]
     fn enable_split_irq(&self) -> Result<()>;
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    fn enable_x2apic_api(&self) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     fn enable_sgx_attribute(&self, file: File) -> Result<()>;
     /// Retrieve guest clock.

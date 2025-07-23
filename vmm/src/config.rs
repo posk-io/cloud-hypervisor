@@ -179,6 +179,9 @@ pub enum ValidationError {
     /// Max is less than boot
     #[error("Max CPUs lower than boot CPUs")]
     CpusMaxLowerThanBoot,
+    /// Too many CPUs.
+    #[error("Too many vCPUs")]
+    TooManyCpus,
     /// Missing file value for debug-console
     #[cfg(target_arch = "x86_64")]
     #[error("Path missing when using file mode for debug console")]
@@ -553,11 +556,11 @@ impl CpusConfig {
             .add("features");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
-        let boot_vcpus: u8 = parser
+        let boot_vcpus: u32 = parser
             .convert("boot")
             .map_err(Error::ParseCpus)?
             .unwrap_or(DEFAULT_VCPUS);
-        let max_vcpus: u8 = parser
+        let max_vcpus: u32 = parser
             .convert("max")
             .map_err(Error::ParseCpus)?
             .unwrap_or(boot_vcpus);
@@ -572,7 +575,7 @@ impl CpusConfig {
             .map_err(Error::ParseCpus)?
             .unwrap_or(DEFAULT_MAX_PHYS_BITS);
         let affinity = parser
-            .convert::<Tuple<u8, Vec<usize>>>("affinity")
+            .convert::<Tuple<u32, Vec<usize>>>("affinity")
             .map_err(Error::ParseCpus)?
             .map(|v| {
                 v.0.iter()
@@ -2045,7 +2048,7 @@ impl NumaConfig {
         let cpus = parser
             .convert::<IntegerList>("cpus")
             .map_err(Error::ParseNuma)?
-            .map(|v| v.0.iter().map(|e| *e as u8).collect());
+            .map(|v| v.0.iter().map(|e| *e as u32).collect());
         let distances = parser
             .convert::<Tuple<u64, u64>>("distances")
             .map_err(Error::ParseNuma)?
@@ -2383,6 +2386,23 @@ impl VmConfig {
             return Err(ValidationError::CpusMaxLowerThanBoot);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        const MAX_SUPPORTED_CPUS: u32 = (u16::MAX - 1) as u32;
+        #[cfg(not(target_arch = "x86_64"))]
+        const MAX_SUPPORTED_CPUS: u32 = 255;
+
+        if self.cpus.max_vcpus > MAX_SUPPORTED_CPUS {
+            // Note: historically, Cloud Hypvervisor did not support more than 255(254 on x64)
+            // vCPUs: self.cpus.max_vcpus was of type u8, so 255 was the maximum;
+            // on x86_64, the legacy mptable/apic was limited to 254 CPUs.
+            //
+            // Now the limit is lifted on Intel x86_64 targets, and will soon be lifted on
+            // AMD x64_64 targets as well.
+            //
+            // Other targests/archs: TBD.
+            return Err(ValidationError::TooManyCpus);
+        }
+
         if let Some(rate_limit_groups) = &self.rate_limit_groups {
             for rate_limit_group in rate_limit_groups {
                 rate_limit_group.validate(self)?;
@@ -2474,7 +2494,10 @@ impl VmConfig {
                 return Err(ValidationError::CpuTopologyDiesPerPackage);
             }
 
-            let total = t.threads_per_core * t.cores_per_die * t.dies_per_package * t.packages;
+            let total: u32 = (t.threads_per_core as u32)
+                * (t.cores_per_die as u32)
+                * (t.dies_per_package as u32)
+                * (t.packages as u32);
             if total != self.cpus.max_vcpus {
                 return Err(ValidationError::CpuTopologyCount);
             }

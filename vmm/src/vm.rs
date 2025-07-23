@@ -892,6 +892,26 @@ impl Vm {
             vm_config.lock().unwrap().is_sev_snp_enabled()
         };
 
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        let max_apic_id = {
+            let config = vm_config.lock().unwrap();
+            if let Some(topology) = config.cpus.topology.clone() {
+                arch::x86_64::get_max_x2apic_id((
+                    topology.threads_per_core,
+                    topology.cores_per_die,
+                    topology.dies_per_package,
+                    topology.packages,
+                ))
+            } else {
+                config.cpus.max_vcpus
+            }
+        };
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        if matches!(hypervisor.get_cpu_vendor(), hypervisor::CpuVendor::AMD) && max_apic_id > 254 {
+            log::error!("VMs with APIC IDs larger than 254 are not yet supported on AMD hosts.");
+            return Err(Error::VmNotCreated);
+        }
+
         let vm = Self::create_hypervisor_vm(
             &hypervisor,
             #[cfg(feature = "tdx")]
@@ -901,6 +921,11 @@ impl Vm {
             #[cfg(feature = "sev_snp")]
             vm_config.lock().unwrap().memory.total_size(),
         )?;
+
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        if max_apic_id > 254 {
+            vm.enable_x2apic_api().unwrap();
+        }
 
         let phys_bits = physical_bits(&hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
 
@@ -1568,7 +1593,7 @@ impl Vm {
 
     pub fn resize(
         &mut self,
-        desired_vcpus: Option<u8>,
+        desired_vcpus: Option<u32>,
         desired_memory: Option<u64>,
         desired_balloon: Option<u64>,
     ) -> Result<()> {

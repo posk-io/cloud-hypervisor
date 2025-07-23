@@ -57,6 +57,8 @@ const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
 
+const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
+
 pub const _NSIG: i32 = 65;
 
 #[derive(Debug, Copy, Clone)]
@@ -209,11 +211,11 @@ pub enum Error {
     E820Configuration,
 }
 
-pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u8, u8, u8)>) -> u32 {
+pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u16, u16, u16, u16)>) -> u32 {
     if let Some(t) = topology {
-        let thread_mask_width = u8::BITS - (t.0 - 1).leading_zeros();
-        let core_mask_width = u8::BITS - (t.1 - 1).leading_zeros();
-        let die_mask_width = u8::BITS - (t.2 - 1).leading_zeros();
+        let thread_mask_width = u16::BITS - (t.0 - 1).leading_zeros();
+        let core_mask_width = u16::BITS - (t.1 - 1).leading_zeros();
+        let die_mask_width = u16::BITS - (t.2 - 1).leading_zeros();
 
         let thread_id = cpu_id % (t.0 as u32);
         let core_id = cpu_id / (t.0 as u32) % (t.1 as u32);
@@ -227,6 +229,13 @@ pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u8, u8, u8)>) -> u32 {
     }
 
     cpu_id
+}
+
+pub fn get_max_x2apic_id(topology: (u16, u16, u16, u16)) -> u32 {
+    get_x2apic_id(
+        (topology.0 as u32 * topology.1 as u32 * topology.2 as u32 * topology.3 as u32) - 1,
+        Some(topology),
+    )
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -738,6 +747,10 @@ pub fn generate_common_cpuid(
                 entry.eax = (entry.eax & 0xffff_ff00) | (config.phys_bits as u32 & 0xff);
             }
             0x4000_0001 => {
+                // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
+                // device interrupts to cpus with APIC IDs > 254 without interrupt remapping.
+                entry.eax |= 1 << KVM_FEATURE_MSI_EXT_DEST_ID;
+
                 // These features are not supported by TDX
                 #[cfg(feature = "tdx")]
                 if config.tdx {
@@ -820,14 +833,14 @@ pub fn generate_common_cpuid(
 
 pub fn configure_vcpu(
     vcpu: &Arc<dyn hypervisor::Vcpu>,
-    id: u8,
+    id: u32,
     boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
     cpuid: Vec<CpuIdEntry>,
     kvm_hyperv: bool,
     cpu_vendor: CpuVendor,
-    topology: Option<(u8, u8, u8)>,
+    topology: (u16, u16, u16, u16),
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id as u32, topology);
+    let x2apic_id = get_x2apic_id(id, Some(topology));
 
     // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
@@ -849,9 +862,9 @@ pub fn configure_vcpu(
     }
     assert!(apic_id_patched);
 
-    if let Some(t) = topology {
-        update_cpuid_topology(&mut cpuid, t.0, t.1, t.2, cpu_vendor, id);
-    }
+    update_cpuid_topology(
+        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
+    );
 
     // The TSC frequency CPUID leaf should not be included when running with HyperV emulation
     if !kvm_hyperv {
@@ -896,7 +909,15 @@ pub fn configure_vcpu(
     if let Some((kernel_entry_point, guest_memory)) = boot_setup {
         regs::setup_regs(vcpu, kernel_entry_point).map_err(Error::RegsConfiguration)?;
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
-        regs::setup_sregs(&guest_memory.memory(), vcpu).map_err(Error::SregsConfiguration)?;
+
+        // CPUs are required (by Intel sdm spec) to boot in x2apic mode if any
+        // of the apic IDs is larger than 255. Experimentally, the Linux kernel
+        // does not recognize the last vCPU if x2apic is not enabled when
+        // there are 256 vCPUs in a flat hierarchy (i.e. max x2apic ID is 255),
+        // so we need to enable x2apic in this case as well.
+        let enable_x2_apic_mode = get_max_x2apic_id(topology) >= 255;
+        regs::setup_sregs(&guest_memory.memory(), vcpu, enable_x2_apic_mode)
+            .map_err(Error::SregsConfiguration)?;
     }
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
@@ -946,14 +967,14 @@ pub fn configure_system(
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
     initramfs: &Option<InitramfsConfig>,
-    _num_cpus: u8,
+    _num_cpus: u32,
     setup_header: Option<setup_header>,
     rsdp_addr: Option<GuestAddress>,
     sgx_epc_region: Option<SgxEpcRegion>,
     serial_number: Option<&str>,
     uuid: Option<&str>,
     oem_strings: Option<&[&str]>,
-    topology: Option<(u8, u8, u8)>,
+    topology: Option<(u16, u16, u16, u16)>,
 ) -> super::Result<()> {
     // Write EBDA address to location where ACPICA expects to find it
     guest_mem
@@ -1361,62 +1382,59 @@ pub fn get_host_cpu_phys_bits(hypervisor: &Arc<dyn hypervisor::Hypervisor>) -> u
 
 fn update_cpuid_topology(
     cpuid: &mut Vec<CpuIdEntry>,
-    threads_per_core: u8,
-    cores_per_die: u8,
-    dies_per_package: u8,
+    threads_per_core: u16,
+    cores_per_die: u16,
+    dies_per_package: u16,
+    packages: u16,
     cpu_vendor: CpuVendor,
-    id: u8,
+    id: u32,
 ) {
     let x2apic_id = get_x2apic_id(
-        id as u32,
-        Some((threads_per_core, cores_per_die, dies_per_package)),
+        id,
+        Some((threads_per_core, cores_per_die, dies_per_package, packages)),
     );
 
-    let thread_width = 8 - (threads_per_core - 1).leading_zeros();
-    let core_width = (8 - (cores_per_die - 1).leading_zeros()) + thread_width;
-    let die_width = (8 - (dies_per_package - 1).leading_zeros()) + core_width;
+    // Note: the topology defined here is per "package" (~NUMA node).
+    let thread_width = u16::BITS - (threads_per_core - 1).leading_zeros();
+    let core_width = u16::BITS - (cores_per_die - 1).leading_zeros();
+    let die_width = u16::BITS - (dies_per_package - 1).leading_zeros();
 
+    let logical_cpus_per_package =
+        (threads_per_core as u32) * (cores_per_die as u32) * (dies_per_package as u32);
+
+    // The very old way: a flat number of logical CPUs per package: CPUID.1H:EBX[23:16] bits.
     let mut cpu_ebx = CpuidPatch::get_cpuid_reg(cpuid, 0x1, None, CpuidReg::EBX).unwrap_or(0);
-    cpu_ebx |= ((dies_per_package as u32) * (cores_per_die as u32) * (threads_per_core as u32))
-        & (0xff << 16);
+    if logical_cpus_per_package > 0xff {
+        // Overflow. Indicate as many as we can for legacy systems.
+        cpu_ebx |= 0xff << 16;
+    } else {
+        cpu_ebx &= !(0xff << 16); // Clear bits 23:16.
+        cpu_ebx |= (logical_cpus_per_package & 0xff) << 16;
+    }
     CpuidPatch::set_cpuid_reg(cpuid, 0x1, None, CpuidReg::EBX, cpu_ebx);
 
     let mut cpu_edx = CpuidPatch::get_cpuid_reg(cpuid, 0x1, None, CpuidReg::EDX).unwrap_or(0);
     cpu_edx |= 1 << 28;
     CpuidPatch::set_cpuid_reg(cpuid, 0x1, None, CpuidReg::EDX, cpu_edx);
 
+    // The legacy way: threads+cores per package.
     // CPU Topology leaf 0xb
     CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::EAX, thread_width);
-    CpuidPatch::set_cpuid_reg(
-        cpuid,
-        0xb,
-        Some(0),
-        CpuidReg::EBX,
-        u32::from(threads_per_core),
-    );
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::EBX, threads_per_core as u32);
     CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::ECX, 1 << 8);
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::EDX, x2apic_id);
 
-    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::EAX, die_width);
-    CpuidPatch::set_cpuid_reg(
-        cpuid,
-        0xb,
-        Some(1),
-        CpuidReg::EBX,
-        u32::from(dies_per_package * cores_per_die * threads_per_core),
-    );
-    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::ECX, 2 << 8);
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::EAX, core_width + die_width);
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::EBX, logical_cpus_per_package);
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::ECX, (2 << 8) | 1);
     CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::EDX, x2apic_id);
 
+    // The modern way: many-level hierarcy (but we here only support four levels).
     // CPU Topology leaf 0x1f
     CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(0), CpuidReg::EAX, thread_width);
-    CpuidPatch::set_cpuid_reg(
-        cpuid,
-        0x1f,
-        Some(0),
-        CpuidReg::EBX,
-        u32::from(threads_per_core),
-    );
+    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(0), CpuidReg::EBX, threads_per_core as u32);
     CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(0), CpuidReg::ECX, 1 << 8);
+    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(0), CpuidReg::EDX, x2apic_id);
 
     CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(1), CpuidReg::EAX, core_width);
     CpuidPatch::set_cpuid_reg(
@@ -1424,19 +1442,33 @@ fn update_cpuid_topology(
         0x1f,
         Some(1),
         CpuidReg::EBX,
-        u32::from(cores_per_die * threads_per_core),
+        (threads_per_core as u32) * (cores_per_die as u32),
     );
-    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(1), CpuidReg::ECX, 2 << 8);
+    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(1), CpuidReg::ECX, (2 << 8) | 1);
+    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(1), CpuidReg::EDX, x2apic_id);
 
-    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::EAX, die_width);
-    CpuidPatch::set_cpuid_reg(
-        cpuid,
-        0x1f,
-        Some(2),
-        CpuidReg::EBX,
-        u32::from(dies_per_package * cores_per_die * threads_per_core),
-    );
-    CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::ECX, 5 << 8);
+    if die_width > 0 {
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::EAX, die_width);
+        CpuidPatch::set_cpuid_reg(
+            cpuid,
+            0x1f,
+            Some(1),
+            CpuidReg::EBX,
+            (threads_per_core as u32) * (cores_per_die as u32) * (dies_per_package as u32),
+        );
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::ECX, (5 << 8) | 2);
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::EDX, x2apic_id);
+
+        // Mark the end of topology.
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(3), CpuidReg::EAX, 0);
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(3), CpuidReg::EBX, 0);
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(3), CpuidReg::ECX, 0);
+    } else {
+        // Mark the end of topology.
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::EAX, 0);
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::EBX, 0);
+        CpuidPatch::set_cpuid_reg(cpuid, 0x1f, Some(2), CpuidReg::ECX, 0);
+    }
 
     if matches!(cpu_vendor, CpuVendor::AMD) {
         CpuidPatch::set_cpuid_reg(
@@ -1721,22 +1753,30 @@ mod tests {
 
     #[test]
     fn test_get_x2apic_id() {
-        let x2apic_id = get_x2apic_id(0, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(0, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 0);
 
-        let x2apic_id = get_x2apic_id(1, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(1, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 1);
 
-        let x2apic_id = get_x2apic_id(2, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(2, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 2);
 
-        let x2apic_id = get_x2apic_id(6, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(6, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 8);
 
-        let x2apic_id = get_x2apic_id(7, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(7, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 9);
 
-        let x2apic_id = get_x2apic_id(8, Some((2, 3, 1)));
+        let x2apic_id = get_x2apic_id(8, Some((2, 3, 1, 1)));
         assert_eq!(x2apic_id, 10);
+
+        let x2apic_id = get_x2apic_id(257, Some((1, 312, 1, 1)));
+        assert_eq!(x2apic_id, 257);
+
+        let x2apic_id = get_x2apic_id(1234, Some((1, 5678, 1, 1)));
+        assert_eq!(x2apic_id, 1234);
+
+        assert_eq!(255, get_max_x2apic_id((1, 256, 1, 1)));
     }
 }
